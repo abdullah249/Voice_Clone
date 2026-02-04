@@ -236,7 +236,7 @@ Keep responses under 100 words unless asked for more detail."""
 def create_ui():
     chat = VoiceChatUI()
     
-    with gr.Blocks(title="Real-Time Voice Cloning Chatbot", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Real-Time Voice Cloning Chatbot") as demo:
         gr.Markdown("""
         # 🎤 Real-Time Voice Cloning Chatbot
         
@@ -364,4 +364,5 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
+        theme=gr.themes.Soft(),
     )
