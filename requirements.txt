@@ -1,0 +1,24 @@
+# Real-Time Voice Cloning Chatbot Dependencies
+
+# Qwen3-TTS (install from GitHub)
+# pip install git+https://github.com/QwenLM/Qwen3-TTS.git
+
+# Speech-to-Text
+openai-whisper
+
+# Audio processing
+sounddevice
+soundfile
+numpy
+librosa
+gradio
+
+# LLM providers
+requests  # For Ollama
+openai    # For OpenAI (optional)
+
+# PyTorch (install separately based on your CUDA version)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Flash Attention (optional, for faster inference)
+# pip install flash-attn --no-build-isolation
