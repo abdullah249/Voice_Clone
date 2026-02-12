@@ -4,11 +4,19 @@
 import os
 import tempfile
 import numpy as np
+import torch
 import gradio as gr
+
+# Optimize CPU inference: use both vCPUs
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
 
 # Set SoX path (local installation)
 SOX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sox-14.4.2")
 os.environ["PATH"] = SOX_PATH + os.pathsep + os.environ.get("PATH", "")
+
+# Groq API key — set via environment variable or .env file
+# export GROQ_API_KEY="your-key-here"
 
 # Global model holders
 tts_model = None
@@ -17,29 +25,75 @@ voice_clone_prompt = None
 conversation_history = []
 
 
-def load_whisper(model_size="base"):
+# --- Pre-load models at startup ---
+print("⏳ Pre-loading Whisper tiny...")
+import whisper as _whisper
+whisper_model = _whisper.load_model("tiny")
+print("✅ Whisper tiny loaded!")
+
+print("⏳ Pre-loading TTS 0.6B (this takes a few minutes on CPU)...")
+import torch as _torch
+from qwen_tts import Qwen3TTSModel as _Qwen3TTSModel
+_device = "cuda:0" if _torch.cuda.is_available() else "cpu"
+tts_model = _Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    device_map=_device,
+    dtype=_torch.bfloat16,
+    attn_implementation="sdpa",
+)
+import gc; gc.collect()
+print("✅ TTS 0.6B loaded!")
+print("🚀 Models ready — starting Gradio UI...")
+
+
+def load_whisper(model_size="tiny"):
     """Load Whisper model."""
     global whisper_model
     import whisper
+    import gc
+    gc.collect()
     whisper_model = whisper.load_model(model_size)
-    return "✅ Whisper loaded!"
+    return f"✅ Whisper '{model_size}' loaded!"
 
 
-def load_tts(model_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base"):
+def load_tts(model_path="Qwen/Qwen3-TTS-12Hz-0.6B-Base"):
     """Load Qwen3-TTS model."""
     global tts_model
     import torch
+    import gc
     from qwen_tts import Qwen3TTSModel
     
+    gc.collect()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    tts_model = Qwen3TTSModel.from_pretrained(
-        model_path,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation="sdpa",  # Windows-compatible default
-    )
-    return "✅ TTS loaded!"
+    dtype = torch.bfloat16  # Always use bfloat16 to save memory (works on CPU too)
+    
+    try:
+        tts_model = Qwen3TTSModel.from_pretrained(
+            model_path,
+            device_map=device,
+            dtype=dtype,
+            attn_implementation="sdpa",
+        )
+        gc.collect()
+        return f"✅ TTS '{model_path.split('/')[-1]}' loaded!"
+    except Exception as e:
+        gc.collect()
+        return f"❌ TTS load failed: {e}"
+
+
+def _trim_audio(audio_path, max_seconds=5):
+    """Trim audio to max_seconds. Voice cloning only needs 5s of clear speech."""
+    import soundfile as sf
+    data, sr = sf.read(audio_path)
+    duration = len(data) / sr
+    if duration <= max_seconds:
+        return audio_path, duration
+    # Take from the start (usually cleaner speech)
+    end_sample = int(max_seconds * sr)
+    trimmed = data[:end_sample]
+    trimmed_path = audio_path + ".trimmed.wav"
+    sf.write(trimmed_path, trimmed, sr)
+    return trimmed_path, duration
 
 
 def create_voice_clone(audio_path, audio_text):
@@ -51,30 +105,51 @@ def create_voice_clone(audio_path, audio_text):
     if tts_model is None:
         return "❌ Load TTS model first!"
     
-    # Clear GPU memory before cloning
-    torch.cuda.empty_cache()
+    if audio_path is None:
+        return "❌ Please upload an audio file first!"
+    
+    # Clear memory before cloning
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
     
     try:
+        # Auto-trim long audio — voice cloning only needs ~5 seconds
+        trimmed_path, original_duration = _trim_audio(audio_path, max_seconds=5)
+        trim_msg = ""
+        if original_duration > 5:
+            trim_msg = f" (auto-trimmed {original_duration:.0f}s → 5s)"
+        
         if audio_text and audio_text.strip():
             voice_clone_prompt = tts_model.create_voice_clone_prompt(
-                ref_audio=audio_path,
+                ref_audio=trimmed_path,
                 ref_text=audio_text.strip(),
                 x_vector_only_mode=False,
             )
         else:
             voice_clone_prompt = tts_model.create_voice_clone_prompt(
-                ref_audio=audio_path,
+                ref_audio=trimmed_path,
                 x_vector_only_mode=True,
             )
         
+        # Clean up trimmed file
+        import os
+        if trimmed_path != audio_path and os.path.exists(trimmed_path):
+            os.unlink(trimmed_path)
+        
         # Clear cache after operation
-        torch.cuda.empty_cache()
-        return "✅ Voice cloned!"
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
-        return "❌ Out of GPU memory! Try using the smaller 0.6B model."
+        return f"✅ Voice cloned!{trim_msg}"
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        return "❌ Out of memory! Try using the smaller 0.6B model."
+    except Exception as e:
+        gc.collect()
+        return f"❌ Voice clone failed: {e}"
 
 
 def speech_to_text(audio_path):
@@ -93,8 +168,10 @@ def get_llm_response(user_message, provider="groq", model="llama-3.1-8b-instant"
     
     conversation_history.append({"role": "user", "content": user_message})
     
-    system = "You are a helpful voice assistant. Keep responses concise and conversational, under 100 words."
-    messages = [{"role": "system", "content": system}] + conversation_history
+    system = "You are a helpful voice assistant. Keep responses VERY short - maximum 1-2 sentences, under 20 words. Be brief."
+    # Only send last 4 messages (2 exchanges) to keep LLM context small & responses fresh
+    recent = conversation_history[-4:]
+    messages = [{"role": "system", "content": system}] + recent
     
     try:
         if provider == "groq":
@@ -104,7 +181,7 @@ def get_llm_response(user_message, provider="groq", model="llama-3.1-8b-instant"
             resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 200},
+                json={"model": model, "messages": messages, "max_tokens": 40},
                 timeout=30
             )
             resp.raise_for_status()
@@ -117,7 +194,7 @@ def get_llm_response(user_message, provider="groq", model="llama-3.1-8b-instant"
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 200},
+                json={"model": model, "messages": messages, "max_tokens": 40},
                 timeout=30
             )
             resp.raise_for_status()
@@ -145,16 +222,30 @@ def get_llm_response(user_message, provider="groq", model="llama-3.1-8b-instant"
 def text_to_speech_cloned(text):
     """Convert text to speech with cloned voice."""
     global tts_model, voice_clone_prompt
+    import gc
     
     if tts_model is None or voice_clone_prompt is None:
         return None
+    
+    gc.collect()
+    # Truncate text to ~20 words max to keep TTS generation fast on CPU
+    words = text.split()
+    if len(words) > 20:
+        text = ' '.join(words[:20]) + '...'
+    
+    # Dynamic max_new_tokens: 12Hz codec = 12 tokens/sec of audio
+    # ~20 tokens per word is generous. Min 50, max 200.
+    word_count = len(text.split())
+    max_tokens = min(max(50, word_count * 20), 200)
+    print(f"[TTS] text={text!r} words={word_count} max_tokens={max_tokens}")
     
     wavs, sr = tts_model.generate_voice_clone(
         text=text,
         language="Auto",
         voice_clone_prompt=voice_clone_prompt,
-        max_new_tokens=4096,
+        max_new_tokens=max_tokens,
     )
+    gc.collect()
     return (sr, wavs[0])
 
 
@@ -225,25 +316,26 @@ with gr.Blocks(title="Voice Clone Chat") as demo:
     gr.Markdown("# 🎤 Real-Time Voice Cloning Chatbot")
     
     with gr.Tab("⚙️ Setup"):
-        gr.Markdown("### Step 1: Load Models")
+        gr.Markdown("### Step 1: Models (auto-loaded at startup)")
         with gr.Row():
-            whisper_size = gr.Dropdown(["tiny", "base", "small"], value="base", label="Whisper Size")
-            load_whisper_btn = gr.Button("Load Whisper")
-            whisper_status = gr.Textbox(label="Status", interactive=False)
+            whisper_size = gr.Dropdown(["tiny", "base", "small"], value="tiny", label="Whisper Size")
+            load_whisper_btn = gr.Button("Reload Whisper")
+            whisper_status = gr.Textbox(label="Status", value="✅ Whisper 'tiny' loaded!", interactive=False)
         
         with gr.Row():
             tts_path = gr.Dropdown(
                 ["Qwen/Qwen3-TTS-12Hz-0.6B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"],
                 value="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-                label="TTS Model (0.6B recommended for 6GB GPU)"
+                label="TTS Model"
             )
-            load_tts_btn = gr.Button("Load TTS")
-            tts_status = gr.Textbox(label="Status", interactive=False)
+            load_tts_btn = gr.Button("Reload TTS")
+            tts_status = gr.Textbox(label="Status", value="✅ TTS 'Qwen3-TTS-12Hz-0.6B-Base' loaded!", interactive=False)
         
         gr.Markdown("### Step 2: Clone Voice")
-        clone_audio = gr.Audio(label="Upload Voice Sample", type="filepath")
+        clone_audio = gr.Audio(label="Upload Voice Sample (5-10 sec recommended)", type="filepath")
         clone_text = gr.Textbox(label="Transcript (optional)", placeholder="What is said in the audio...")
         clone_btn = gr.Button("Clone Voice")
+        gr.Markdown("⚠️ *Long audio is auto-trimmed to 10s. On CPU servers, cloning takes ~60s. Please wait.*")
         clone_status = gr.Textbox(label="Status", interactive=False)
         
         gr.Markdown("### Step 3: LLM Settings")
@@ -259,7 +351,7 @@ with gr.Blocks(title="Voice Clone Chat") as demo:
             info="Groq: llama-3.1-8b-instant, mixtral-8x7b-32768 | OpenAI: gpt-4o-mini | Ollama: qwen2.5:7b"
         )
         api_key = gr.Textbox(
-            value=os.getenv("GROQ_API_KEY", ""),
+            value=os.environ.get("GROQ_API_KEY", ""),
             label="API Key (required for Groq/OpenAI)",
             type="password",
             placeholder="Paste your API key here..."
