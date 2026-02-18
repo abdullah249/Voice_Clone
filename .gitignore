@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large)
+*.bin
+*.safetensors
+*.ckpt
+
+# Audio temp files
+*.wav
+*.mp3
+*.flac
+!sox-14.4.2/
+
+# Voice prompt (binary, user-specific)
+voice_prompt.pt

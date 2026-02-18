@@ -17,7 +17,7 @@ torch.set_num_interop_threads(1)
 SOX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sox-14.4.2")
 os.environ["PATH"] = SOX_PATH + os.pathsep + os.environ.get("PATH", "")
 
-# API keys — set via environment variables (never hardcode secrets)
+# Groq API key
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
 
 # ElevenLabs API (cloud TTS for phone pipeline)
