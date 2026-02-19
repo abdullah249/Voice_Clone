@@ -9,11 +9,13 @@ played back.  The loop repeats until the caller hangs up.
 
 Flow per call:
   1. StasisStart → answer channel
-  2. Short delay → start recording (beep signals "speak now")
-  3. RecordingFinished → download audio → start music-on-hold
-  4. Send audio to Flask /api/pipeline  (STT → LLM → cloned-voice TTS)
-  5. Stop MOH → play TTS response WAV
-  6. PlaybackFinished → go to step 2
+  2. Short beep → start recording (dynamic silence detection)
+  3. RecordingFinished → beep → send to pipeline
+  4. Play TTS response WAV
+  5. PlaybackFinished → go to step 2
+
+Designed for real-time conversational feel: fast silence detection,
+no hold music, minimal latency between turns.
 
 Requirements:
   pip install aiohttp requests
@@ -49,9 +51,9 @@ FLASK_API = "http://127.0.0.1:5050"
 # Where TTS response WAVs are saved for Asterisk to play back
 PLAYBACK_DIR = "/tmp/ari_voice_agent"
 
-# Recording parameters
-MAX_SILENCE_SEC = 3    # stop recording after 3 s of silence
-MAX_RECORD_SEC  = 15   # absolute cap per turn
+# Recording parameters — tuned for real-time conversational feel
+MAX_SILENCE_SEC = 2    # stop after 2s silence (ARI requires integer)
+MAX_RECORD_SEC  = 10   # keep turns short for faster responses
 DTMF_TERMINATE  = "#"  # caller can press # to finish early
 
 # ─── Logging ────────────────────────────────────────────────────────────────
@@ -127,9 +129,9 @@ def start_recording(channel_id: str, name: str):
     return ari("POST", f"/channels/{channel_id}/record", params={
         "name":               name,
         "format":             "wav",
-        "maxDurationSeconds":  str(MAX_RECORD_SEC),
-        "maxSilenceSeconds":   str(MAX_SILENCE_SEC),
-        "beep":               "true",
+        "maxDurationSeconds":  int(MAX_RECORD_SEC),
+        "maxSilenceSeconds":   int(MAX_SILENCE_SEC),
+        "beep":               "false",   # we play our own beep for tighter control
         "terminateOn":         DTMF_TERMINATE,
         "ifExists":           "overwrite",
     })
@@ -215,9 +217,12 @@ async def on_stasis_start(event: dict):
 
     # Answer the channel
     answer_channel(channel_id)
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.3)
 
-    # Begin first turn – beep tells caller to speak
+    # Short beep to signal "speak now" then immediately start recording
+    play_media(channel_id, "sound:custom/processing-beep")
+    await asyncio.sleep(0.3)  # let beep play
+
     sess.state = "listening"
     sess.turn += 1
     rec_name = f"vc_{sess.call_id}_{sess.turn}"
@@ -260,8 +265,8 @@ async def on_recording_finished(event: dict):
         hangup_channel(channel_id)
         return
 
-    # Play music-on-hold while the pipeline runs
-    start_moh(channel_id)
+    # Quick beep to acknowledge we heard them — processing starts
+    play_media(channel_id, "sound:custom/processing-beep")
 
     # Run pipeline in thread pool (blocking I/O)
     loop = asyncio.get_running_loop()
@@ -276,9 +281,6 @@ async def on_recording_finished(event: dict):
     if not sess.active or channel_id not in active_calls:
         log.info("   Call ended during processing")
         return
-
-    # Stop music-on-hold
-    stop_moh(channel_id)
 
     if response_stem is None:
         log.error("   Pipeline failed – hanging up")
@@ -308,7 +310,10 @@ async def on_playback_finished(event: dict):
     if sess.state != "speaking" or not sess.active:
         return
 
-    # Start next recording turn
+    # Quick beep then start next recording turn — no delay
+    play_media(channel_id, "sound:custom/processing-beep")
+    await asyncio.sleep(0.3)
+
     sess.state = "listening"
     sess.turn += 1
     rec_name = f"vc_{sess.call_id}_{sess.turn}"
