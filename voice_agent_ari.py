@@ -247,10 +247,18 @@ async def on_recording_finished(event: dict):
 
     log.info("⏹️   Recording done: %s  dur=%ss talk=%ss", rec_name, duration, talk_dur)
 
-    # If no speech detected, re-prompt
+    # If no speech detected, re-prompt (with channel existence check)
     if talk_dur is not None and talk_dur <= 0:
         log.info("   No speech – re-listening")
         delete_recording(rec_name)
+        # Verify channel still exists before re-recording
+        ch_check = ari("GET", f"/channels/{channel_id}")
+        if not ch_check or ch_check.status_code != 200:
+            log.info("   Channel gone – stopping")
+            if channel_id in active_calls:
+                sess2 = active_calls.pop(channel_id)
+                sess2.active = False
+            return
         sess.turn += 1
         new_name = f"vc_{sess.call_id}_{sess.turn}"
         start_recording(channel_id, new_name)
@@ -301,18 +309,21 @@ async def on_recording_finished(event: dict):
 
 async def on_playback_finished(event: dict):
     pb = event.get("playback", {})
+    pb_id = pb.get("id", "")
     target_uri = pb.get("target_uri", "")
     channel_id = target_uri.split(":", 1)[1] if ":" in target_uri else None
     if not channel_id or channel_id not in active_calls:
         return
 
     sess = active_calls[channel_id]
+    # Only proceed if this is a response playback (pb_ prefix), not a beep
+    if not pb_id.startswith("pb_"):
+        return
     if sess.state != "speaking" or not sess.active:
         return
 
-    # Quick beep then start next recording turn — no delay
-    play_media(channel_id, "sound:custom/processing-beep")
-    await asyncio.sleep(0.3)
+    # Brief pause after playback to avoid echo, then start recording
+    await asyncio.sleep(0.5)
 
     sess.state = "listening"
     sess.turn += 1

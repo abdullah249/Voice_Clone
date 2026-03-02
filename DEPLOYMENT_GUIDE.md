@@ -400,7 +400,7 @@ If using a cloud provider (DigitalOcean, AWS, GCP, etc.), also open ports in the
 │    │                                            │
 │    ▼ Port 7860 (or 80/443 via Nginx)            │
 │  ┌─────────────────────────────────────┐        │
-│  │  Gradio Web UI  (0.0.0.0:7860)     │        │
+│  │  Gradio Web UI  (0.0.0.0:7860)      │        │
 │  │  ┌─────────────────────────────┐    │        │
 │  │  │ Flask API (127.0.0.1:5050)  │    │        │
 │  │  │ (internal only, for phone)  │    │        │
@@ -409,7 +409,7 @@ If using a cloud provider (DigitalOcean, AWS, GCP, etc.), also open ports in the
 │    │                                            │
 │    ▼ Port 11434 (local only)                    │
 │  ┌─────────────────────────────────────┐        │
-│  │  Ollama LLM (optional)             │        │
+│  │  Ollama LLM (optional)              │        │
 │  └─────────────────────────────────────┘        │
 └─────────────────────────────────────────────────┘
 ```

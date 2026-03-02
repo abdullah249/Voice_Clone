@@ -47,6 +47,9 @@ if not os.getenv("GROQ_API_KEY"):
     print("⚠️ GROQ_API_KEY not set — Groq STT/LLM will fail. Export it or add to systemd service.")
     os.environ["GROQ_API_KEY"] = ""
 
+# TTS lock — prevent concurrent GPU access (causes queue backup and OOM)
+_tts_lock = threading.Lock()
+
 # ElevenLabs API (cloud TTS for phone pipeline)
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "cjVigY5qzO86Huf0OWal")  # Eric - Smooth, Trustworthy
@@ -191,8 +194,8 @@ _whisper_device = "cuda:1" if _gpu_count >= 2 else ("cuda:0" if _gpu_count >= 1 
 print(f"🖥️ Server: {os.cpu_count()} CPU cores, {_gpu_count} GPUs")
 print(f"📍 TTS → {_tts_device} (RTX 4000), Whisper → {_whisper_device}")
 
-# Load TTS on fastest GPU — 1.7B model (works with float16 on Turing)
-print("⏳ Pre-loading TTS 1.7B on RTX 4000 (float16)...")
+# Load TTS on fastest GPU — 1.7B model, SDPA attention (Turing-compatible)
+print("⏳ Pre-loading TTS 1.7B on RTX 4000 (float16 + SDPA)...")
 try:
     tts_model = _Qwen3TTSModel.from_pretrained(
         "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
@@ -201,7 +204,7 @@ try:
         attn_implementation="sdpa",
         local_files_only=True,
     )
-    print("✅ TTS 1.7B loaded on RTX 4000!")
+    print("✅ TTS 1.7B loaded (float16 + SDPA) on RTX 4000!")
 except Exception as _e:
     print(f"❌ TTS load failed: {_e}")
     tts_model = None
@@ -220,6 +223,24 @@ if os.path.exists(VOICE_PROMPT_PATH):
 print("⏳ Pre-loading Whisper base on GPU...")
 whisper_model = _whisper.load_model("base", device=_whisper_device)
 print(f"✅ Whisper base loaded on {_whisper_device}!")
+
+# Warmup TTS with a short phrase (first call has overhead from CUDA kernel caching)
+if tts_model is not None and voice_clone_prompt is not None:
+    print("⏳ Warming up TTS...")
+    try:
+        import time as _warmup_time
+        _t0 = _warmup_time.time()
+        _warmup_wavs, _warmup_sr = tts_model.generate_voice_clone(
+            text="Hello.",
+            language="english",
+            voice_clone_prompt=voice_clone_prompt,
+            max_new_tokens=12,
+            non_streaming_mode=True,
+        )
+        del _warmup_wavs
+        print(f"✅ TTS warmup done in {_warmup_time.time()-_t0:.1f}s")
+    except Exception as _we:
+        print(f"⚠️ TTS warmup failed: {_we}")
 
 print("🚀 Models ready — starting Gradio UI...")
 
@@ -443,6 +464,7 @@ def text_to_speech_cloned(text):
         language="Auto",
         voice_clone_prompt=voice_clone_prompt,
         max_new_tokens=max_tokens,
+        non_streaming_mode=True,
     )
     gc.collect()
     return (sr, wavs[0])
@@ -730,13 +752,15 @@ def api_tts():
     max_tokens = min(max(50, word_count * 15), 400)
 
     try:
-        wavs, sr = tts_model.generate_voice_clone(
-            text=text,
-            language="Auto",
-            voice_clone_prompt=voice_clone_prompt,
-            max_new_tokens=max_tokens,
-        )
-        gc.collect()
+        with _tts_lock:
+            wavs, sr = tts_model.generate_voice_clone(
+                text=text,
+                language="Auto",
+                voice_clone_prompt=voice_clone_prompt,
+                max_new_tokens=max_tokens,
+                non_streaming_mode=True,
+            )
+            gc.collect()
 
         # Save to temp file and return
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -812,7 +836,7 @@ def api_pipeline():
         call_history = phone_conversations[call_id]
         call_history.append({"role": "user", "content": user_text})
 
-        system = "You are a helpful voice assistant on a phone call. Keep responses SHORT — 1 sentence, under 15 words. Be clear and direct."
+        system = "You are a friendly phone voice assistant having a natural conversation. Keep replies to 1-2 short sentences (around 10-15 words). Be warm, helpful, and conversational. Ask follow-up questions to keep the conversation going. Never give one-word or two-word replies."
         recent = call_history[-8:]
         messages = [{"role": "system", "content": system}] + recent
 
@@ -820,7 +844,7 @@ def api_pipeline():
             resp = req.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": "llama-3.1-8b-instant", "messages": messages, "max_tokens": 40},
+                json={"model": "llama-3.1-8b-instant", "messages": messages, "max_tokens": 60},
                 timeout=30,
             )
             resp.raise_for_status()
@@ -839,40 +863,51 @@ def api_pipeline():
         asterisk_path = tempfile.mktemp(suffix=".wav")
         tts_used = None
 
-        # --- Try local cloned voice first ---
+        # --- Try local cloned voice first (serialized via lock to prevent GPU contention) ---
         if voice_clone_prompt is not None and tts_model is not None:
-            try:
-                import soundfile as _sf
-                tts_text = ai_response
-                words = tts_text.split()
-                if len(words) > 20:
-                    tts_text = " ".join(words[:20])
-                word_count = len(tts_text.split())
-                # 12Hz codec: ~6 tokens per word, cap at 120 for fast phone responses
-                max_tokens = min(max(30, word_count * 6), 120)
+            acquired = _tts_lock.acquire(timeout=15)
+            if not acquired:
+                print(f"[PIPELINE] TTS lock timeout — another request is using GPU, falling back to cloud", flush=True)
+            else:
+                try:
+                    import soundfile as _sf
+                    tts_text = ai_response
+                    words = tts_text.split()
+                    if len(words) > 15:
+                        tts_text = " ".join(words[:15])
+                    word_count = len(tts_text.split())
+                    # 12Hz codec: ~6 tokens per word, cap at 100 for natural phone responses
+                    max_tokens = min(max(36, word_count * 6), 100)
 
-                wavs, sr = tts_model.generate_voice_clone(
-                    text=tts_text,
-                    language="english",
-                    voice_clone_prompt=voice_clone_prompt,
-                    max_new_tokens=max_tokens,
-                )
-                # Save high-quality WAV then convert for Asterisk
-                hq_path = tempfile.mktemp(suffix=".wav")
-                _sf.write(hq_path, wavs[0], sr)
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", hq_path,
-                     "-ar", "8000", "-ac", "1", "-sample_fmt", "s16", asterisk_path],
-                    check=True, capture_output=True,
-                )
-                if os.path.exists(hq_path):
-                    os.unlink(hq_path)
-                tts_used = "cloned-voice"
-                print(f"[PIPELINE] Cloned Voice TTS: {_time.time()-t3:.1f}s", flush=True)
-                gc.collect()
-            except Exception as e:
-                print(f"[PIPELINE] Cloned voice TTS failed ({e}), falling back to cloud TTS", flush=True)
-                tts_used = None
+                    _tts_t0 = _time.time()
+                    wavs, sr = tts_model.generate_voice_clone(
+                        text=tts_text,
+                        language="english",
+                        voice_clone_prompt=voice_clone_prompt,
+                        max_new_tokens=max_tokens,
+                        non_streaming_mode=True,
+                    )
+                    _tts_gen_time = _time.time() - _tts_t0
+                    # Convert to 8kHz mono for Asterisk
+                    _conv_t0 = _time.time()
+                    hq_path = tempfile.mktemp(suffix=".wav")
+                    _sf.write(hq_path, wavs[0], sr)
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", hq_path,
+                         "-ar", "8000", "-ac", "1", "-sample_fmt", "s16", asterisk_path],
+                        check=True, capture_output=True,
+                    )
+                    if os.path.exists(hq_path):
+                        os.unlink(hq_path)
+                    _conv_time = _time.time() - _conv_t0
+                    tts_used = "cloned-voice"
+                    print(f"[PIPELINE] Cloned Voice TTS: {_time.time()-t3:.1f}s (gen={_tts_gen_time:.1f}s conv={_conv_time:.1f}s)", flush=True)
+                    gc.collect()
+                except Exception as e:
+                    print(f"[PIPELINE] Cloned voice TTS failed ({e}), falling back to cloud TTS", flush=True)
+                    tts_used = None
+                finally:
+                    _tts_lock.release()
 
         # --- Fallback: ElevenLabs ---
         if tts_used is None:
@@ -960,9 +995,46 @@ def api_end_call():
     return jsonify({"status": "ok"})
 
 
-# ============================================================
-# Voice Library API (used by admin panel on port 9090)
-# ============================================================
+@flask_app.route("/api/make_call", methods=["POST"])
+def api_make_call():
+    """Originate an outbound call via ARI.
+    POST JSON: {"number": "18573948674"}
+    The call goes out via SIP trunk; when answered, ARI voice agent takes over.
+    """
+    import re as _re
+    data = request.get_json()
+    if not data or "number" not in data:
+        return jsonify({"error": "Missing 'number' field"}), 400
+    number = _re.sub(r"[^\d]", "", data["number"])
+    if not number:
+        return jsonify({"error": "Invalid phone number"}), 400
+
+    # Ensure US number has leading 1
+    if len(number) == 10:
+        number = "1" + number
+
+    # Provider requires 9871 prefix for US outbound calls
+    dial_str = f"9871{number}"
+
+    try:
+        resp = req.post(
+            "http://127.0.0.1:8088/ari/channels",
+            auth=("voiceagent", "voiceagent123"),
+            params={
+                "endpoint": f"PJSIP/{dial_str}@trunk",
+                "app": "voiceagent",
+                "callerId": "Voice Agent <1760990923>",
+                "timeout": 60,
+            },
+            timeout=10,
+        )
+        if resp.status_code in (200, 201):
+            ch = resp.json()
+            return jsonify({"status": "calling", "channel": ch.get("id"), "number": number})
+        else:
+            return jsonify({"error": f"ARI error {resp.status_code}", "detail": resp.text[:300]}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @flask_app.route("/api/voices", methods=["GET"])
 def api_voices_list():
@@ -1085,6 +1157,7 @@ def api_voices_preview():
             language="english",
             voice_clone_prompt=prompt,
             max_new_tokens=max_tokens,
+            non_streaming_mode=True,
         )
         gc.collect()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:

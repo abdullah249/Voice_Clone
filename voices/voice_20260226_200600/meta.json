@@ -1,0 +1,7 @@
+{
+  "name": "voice_20260226_200600",
+  "created": "20260226_200600",
+  "created_epoch": 1772129160.937703,
+  "source_audio": "sample.flac",
+  "model": "Qwen3-TTS-12Hz-1.7B-Base"
+}
