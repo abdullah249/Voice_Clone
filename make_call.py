@@ -74,7 +74,7 @@ def build_endpoint(e164: str, route: str) -> tuple[str, str]:
     raise ValueError(f"Unknown route '{route}'. Use 'naira' or 'astpp'.")
 
 
-def make_call(number: str, route: str = "naira", caller_id: str = "Voice Agent <1001>"):
+def make_call(number: str, route: str = "naira", caller_id: str = "1001"):
     """Originate a call; when remote answers, ARI voice-clone agent takes over."""
     e164 = normalize_to_e164(number)
     if not e164:
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--route", default="naira",
         choices=["naira", "uk", "astpp", "us"],
         help="Outbound trunk: naira=UK working, astpp=legacy US (default: naira)")
-    parser.add_argument("--caller-id", default="Voice Agent <1001>",
+    parser.add_argument("--caller-id", default="1001",
         help="Caller ID presented to the receiver")
     args = parser.parse_args()
     make_call(args.number, args.route, args.caller_id)
