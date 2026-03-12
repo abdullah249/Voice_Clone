@@ -64,6 +64,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("ari-agent")
 
+_file_handler = logging.FileHandler("/tmp/voice_agent_ari_runtime.log")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s  %(message)s"))
+log.addHandler(_file_handler)
+
 # ─── Call Session Tracker ───────────────────────────────────────────────────
 
 class CallSession:
@@ -228,7 +232,7 @@ async def on_stasis_start(event: dict):
         # Inbound call: answer it, play a beep so the caller knows we're live.
         answer_channel(channel_id)
         await asyncio.sleep(0.3)
-        play_media(channel_id, "sound:custom/processing-beep")
+        play_media(channel_id, "sound:beep")
         await asyncio.sleep(0.3)
 
     sess.state = "listening"
@@ -280,15 +284,18 @@ async def on_recording_finished(event: dict):
         log.error("   Failed to download recording %s", rec_name)
         hangup_channel(channel_id)
         return
+    log.info("   Downloaded recording %s (%d bytes)", rec_name, len(audio_bytes))
 
     # Quick beep to acknowledge we heard them — processing starts
-    play_media(channel_id, "sound:custom/processing-beep")
+    play_media(channel_id, "sound:beep")
 
     # Run pipeline in thread pool (blocking I/O)
     loop = asyncio.get_running_loop()
+    log.info("   Sending recording to pipeline for call_id=%s", sess.call_id)
     response_stem = await loop.run_in_executor(
         None, run_pipeline, audio_bytes, sess.call_id,
     )
+    log.info("   Pipeline returned response_stem=%s", response_stem)
 
     # Clean up the ARI recording
     delete_recording(rec_name)

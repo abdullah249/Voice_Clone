@@ -968,9 +968,10 @@ def api_pipeline():
             os.unlink(input_path)
 
         response = send_file(asterisk_path, mimetype="audio/wav", as_attachment=True,
-                         download_name="response.wav")
+                 download_name="response.wav")
         response.headers["X-TTS-Engine"] = tts_used or "unknown"
-        response.headers["X-AI-Response"] = ai_response[:200]
+        safe_ai_response = ai_response.replace("\r", " ").replace("\n", " ")[:200]
+        response.headers["X-AI-Response"] = safe_ai_response
         return response
 
     except Exception as e:
@@ -1032,7 +1033,7 @@ def api_make_call():
         e164 = "+" + digits
 
     route = (data.get("route") or "naira").lower().strip()
-    caller_id = data.get("caller_id", "Voice Agent <1001>")
+    caller_id = data.get("caller_id", "1001")
     timeout_sec = int(data.get("timeout", 60))
 
     if route in ("naira", "uk"):
