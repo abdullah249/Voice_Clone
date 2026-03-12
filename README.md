@@ -140,3 +140,10 @@ This project uses:
 - [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) - Apache 2.0
 - [Whisper](https://github.com/openai/whisper) - MIT
 - [Ollama](https://ollama.ai/) - MIT
+
+## Project Operations Docs
+
+- `DEPLOYMENT_GUIDE.md` - End-to-end app deployment on a fresh server.
+- `ASTERISK_SIP_PLAYBOOK.md` - Repeatable PBX and SIP trunk setup guide for new servers.
+- `ASTERISK_SIP_INCIDENTS_MAR2026.md` - Detailed success/failure log and root causes from the March 2026 rollout.
+- `PROJECT_HANDOVER_STATUS.md` - Current project state and handover checklist.
