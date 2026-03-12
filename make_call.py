@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 Originate an outbound call via Asterisk ARI.
-When the called person picks up, they are connected to the AI voice agent
-which talks using the cloned voice.
+When the called person picks up, the AI voice clone agent takes over.
 
 Usage:
-  python3 make_call.py 18573948674
-  python3 make_call.py +1-857-394-8674
-  python3 make_call.py <any_phone_number>
+  python3 make_call.py +447449868303          # UK via Naira (working route)
+  python3 make_call.py 447449868303           # same, auto-normalised
+  python3 make_call.py +18573948674 --route astpp   # US via ASTPP trunk
 
-The number is dialed out through the SIP trunk.
+Routes:
+  naira  (default) — NairaCalls trunk; UK calls confirmed working
+  astpp            — legacy ASTPP trunk (US, may need provider enablement)
 """
 
 import sys
 import re
+import argparse
 import requests
 
 ARI_URL  = "http://127.0.0.1:8088/ari"
@@ -22,59 +24,103 @@ ARI_PASS = "voiceagent123"
 ARI_APP  = "voiceagent"
 
 
-def clean_number(raw: str) -> str:
-    """Strip everything except digits from the phone number."""
-    return re.sub(r"[^\d]", "", raw)
+def normalize_to_e164(raw: str) -> str:
+    """Normalize messy user input to best-effort E.164 (e.g. +447449868303)."""
+    raw = (raw or "").strip()
+    digits = re.sub(r"[^\d]", "", raw)
+    if not digits:
+        return ""
+    # 00-prefixed international (e.g. 00447449868303)
+    if raw.startswith("00") and len(digits) > 2:
+        return "+" + digits[2:]
+    # Already international with +
+    if raw.startswith("+"):
+        return "+" + digits
+    # Looks like UK (44...) with enough digits
+    if digits.startswith("44") and len(digits) >= 11:
+        return "+" + digits
+    # 11-digit US
+    if digits.startswith("1") and len(digits) == 11:
+        return "+" + digits
+    # 10-digit US local → assume +1
+    if len(digits) == 10:
+        return "+1" + digits
+    # Generic fallback
+    return "+" + digits
 
 
-def make_call(number: str):
-    """Originate an outbound call to `number` via the SIP trunk.
-    When the remote party answers, Asterisk puts the channel into
-    the Stasis(voiceagent) app — the ARI agent takes over from there."""
+def build_endpoint(e164: str, route: str) -> tuple[str, str]:
+    """
+    Return (ARI endpoint string, dial_string) for the chosen route.
+    e164   — normalised number like +447449868303
+    route  — 'naira' or 'astpp'
+    """
+    route = (route or "naira").lower().strip()
+    digits = e164.lstrip("+")
 
-    number = clean_number(number)
-    if not number:
+    if route in ("naira", "uk"):
+        # Dial the E.164 number directly through the naira trunk
+        endpoint = f"PJSIP/{e164}@naira"
+        return endpoint, e164
+
+    if route in ("astpp", "us"):
+        # ASTPP needs 9871 prefix and digits without +
+        if len(digits) == 10:
+            digits = "1" + digits
+        dial = f"9871{digits}"
+        endpoint = f"PJSIP/{dial}@trunk"
+        return endpoint, dial
+
+    raise ValueError(f"Unknown route '{route}'. Use 'naira' or 'astpp'.")
+
+
+def make_call(number: str, route: str = "naira", caller_id: str = "Voice Agent <1001>"):
+    """Originate a call; when remote answers, ARI voice-clone agent takes over."""
+    e164 = normalize_to_e164(number)
+    if not e164:
         print("Error: no valid phone number provided")
         sys.exit(1)
 
-    # Ensure US number has leading 1 (e.g. 4099953437 → 14099953437)
-    if len(number) == 10:
-        number = "1" + number
+    try:
+        endpoint, dial_str = build_endpoint(e164, route)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
 
-    # Provider requires 9871 prefix for US outbound calls
-    dial_str = f"9871{number}"
-    print(f"\U0001f4de  Dialing {number} (→ {dial_str}) via SIP trunk ...")
+    print(f"📞  Dialing {e164} via route={route} (endpoint={endpoint}) ...")
 
-    # ARI originate: create a channel that dials out through the trunk,
-    # and when answered, drop it into our Stasis app.
     resp = requests.post(
         f"{ARI_URL}/channels",
         auth=(ARI_USER, ARI_PASS),
         params={
-            "endpoint":    f"PJSIP/{dial_str}@trunk",
-            "app":         ARI_APP,
-            "callerId":    "Voice Agent <1760990923>",
-            "timeout":     60,
+            "endpoint":  endpoint,
+            "app":       ARI_APP,
+            "appArgs":   "outbound",   # tells voice agent this is outbound
+            "callerId":  caller_id,
+            "timeout":   60,
         },
     )
 
     if resp.status_code in (200, 201):
         data = resp.json()
-        channel_id = data.get("id", "unknown")
-        print(f"✅  Call originated! Channel: {channel_id}")
-        print(f"    Waiting for {number} to pick up ...")
-        print(f"    When they answer, the AI voice agent will start talking.")
-        print(f"    The agent uses your cloned voice.")
+        print(f"✅  Call originated! Channel: {data.get('id', 'unknown')}")
+        print(f"    Waiting for {e164} to pick up ...")
+        print(f"    When answered, the AI voice agent talks in the cloned voice.")
     else:
-        print(f"❌  Failed to originate call: HTTP {resp.status_code}")
+        print(f"❌  Failed: HTTP {resp.status_code}")
         print(f"    {resp.text[:500]}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 make_call.py <phone_number>")
-        print("Example: python3 make_call.py 18573948674")
-        sys.exit(1)
-
-    make_call(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Originate outbound call into ARI cloned-voice agent")
+    parser.add_argument("number",
+        help="Target phone number (e.g. +447449868303 or 447449868303)")
+    parser.add_argument("--route", default="naira",
+        choices=["naira", "uk", "astpp", "us"],
+        help="Outbound trunk: naira=UK working, astpp=legacy US (default: naira)")
+    parser.add_argument("--caller-id", default="Voice Agent <1001>",
+        help="Caller ID presented to the receiver")
+    args = parser.parse_args()
+    make_call(args.number, args.route, args.caller_id)

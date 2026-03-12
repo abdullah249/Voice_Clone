@@ -998,41 +998,81 @@ def api_end_call():
 @flask_app.route("/api/make_call", methods=["POST"])
 def api_make_call():
     """Originate an outbound call via ARI.
-    POST JSON: {"number": "18573948674"}
-    The call goes out via SIP trunk; when answered, ARI voice agent takes over.
+
+    POST JSON:
+      {"number": "+447449868303", "route": "naira"}  <- UK (working)
+      {"number": "+18573948674",  "route": "astpp"}   <- US (needs provider enablement)
+
+    When remote answers, the ARI cloned-voice agent takes over the call.
     """
     import re as _re
+    import requests as _req
+
     data = request.get_json()
     if not data or "number" not in data:
         return jsonify({"error": "Missing 'number' field"}), 400
-    number = _re.sub(r"[^\d]", "", data["number"])
-    if not number:
+
+    raw = (data["number"] or "").strip()
+    digits = _re.sub(r"[^\d]", "", raw)
+    if not digits:
         return jsonify({"error": "Invalid phone number"}), 400
 
-    # Ensure US number has leading 1
-    if len(number) == 10:
-        number = "1" + number
+    # Normalise to E.164
+    if raw.startswith("00") and len(digits) > 2:
+        e164 = "+" + digits[2:]
+    elif raw.startswith("+"):
+        e164 = "+" + digits
+    elif digits.startswith("44") and len(digits) >= 11:
+        e164 = "+" + digits
+    elif digits.startswith("1") and len(digits) == 11:
+        e164 = "+" + digits
+    elif len(digits) == 10:
+        e164 = "+1" + digits
+    else:
+        e164 = "+" + digits
 
-    # Provider requires 9871 prefix for US outbound calls
-    dial_str = f"9871{number}"
+    route = (data.get("route") or "naira").lower().strip()
+    caller_id = data.get("caller_id", "Voice Agent <1001>")
+    timeout_sec = int(data.get("timeout", 60))
+
+    if route in ("naira", "uk"):
+        endpoint = f"PJSIP/{e164}@naira"
+        dial_str = e164
+    elif route in ("astpp", "us"):
+        d = e164.lstrip("+")
+        if len(d) == 10:
+            d = "1" + d
+        dial_str = f"9871{d}"
+        endpoint = f"PJSIP/{dial_str}@trunk"
+    else:
+        return jsonify({"error": f"Unknown route '{route}'. Use naira or astpp."}), 400
 
     try:
-        resp = req.post(
+        resp = _req.post(
             "http://127.0.0.1:8088/ari/channels",
             auth=("voiceagent", "voiceagent123"),
             params={
-                "endpoint": f"PJSIP/{dial_str}@trunk",
-                "app": "voiceagent",
-                "callerId": "Voice Agent <1760990923>",
-                "timeout": 60,
+                "endpoint":  endpoint,
+                "app":       "voiceagent",
+                "appArgs":   "outbound",
+                "callerId":  caller_id,
+                "timeout":   timeout_sec,
             },
             timeout=10,
         )
         if resp.status_code in (200, 201):
             ch = resp.json()
-            return jsonify({"status": "calling", "channel": ch.get("id"), "number": number})
-        else:
-            return jsonify({"error": f"ARI error {resp.status_code}", "detail": resp.text[:300]}), 500
+            return jsonify({
+                "status":    "calling",
+                "channel":   ch.get("id"),
+                "number":    e164,
+                "route":     route,
+                "endpoint":  endpoint,
+            })
+        return jsonify({
+            "error":  f"ARI error {resp.status_code}",
+            "detail": resp.text[:300],
+        }), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

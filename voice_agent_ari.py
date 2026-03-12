@@ -211,23 +211,31 @@ async def on_stasis_start(event: dict):
     channel_id = ch["id"]
     caller = ch.get("caller", {}).get("number", "unknown")
 
+    # args list is set by ARI originate appArgs; "outbound" means we dialled them.
+    is_outbound = "outbound" in event.get("args", [])
+
     sess = CallSession(channel_id, caller)
     active_calls[channel_id] = sess
-    log.info("📞  New call: %s", sess)
+    call_type = "OUTBOUND" if is_outbound else "INBOUND"
+    log.info("📞  New %s call: %s", call_type, sess)
 
-    # Answer the channel
-    answer_channel(channel_id)
-    await asyncio.sleep(0.3)
-
-    # Short beep to signal "speak now" then immediately start recording
-    play_media(channel_id, "sound:custom/processing-beep")
-    await asyncio.sleep(0.3)  # let beep play
+    if is_outbound:
+        # Channel is already Up (remote answered). Calling answer() again
+        # would return 409 — skip it and go straight to listening.
+        # Receiver just said "Hello?" — capture it immediately.
+        await asyncio.sleep(0.5)  # brief pause so the line stabilises
+    else:
+        # Inbound call: answer it, play a beep so the caller knows we're live.
+        answer_channel(channel_id)
+        await asyncio.sleep(0.3)
+        play_media(channel_id, "sound:custom/processing-beep")
+        await asyncio.sleep(0.3)
 
     sess.state = "listening"
     sess.turn += 1
     rec_name = f"vc_{sess.call_id}_{sess.turn}"
     start_recording(channel_id, rec_name)
-    log.info("🎙️   Listening: %s", rec_name)
+    log.info("🎙️   Listening (%s): %s", call_type, rec_name)
 
 
 async def on_recording_finished(event: dict):
